@@ -39,6 +39,12 @@ if [[ ! -d "$PROJECTS_DIR" ]]; then
     exit 1
 fi
 
+if ! [[ -f "$PRICING_CONF" ]]; then
+    if test -h "$0"; then
+        PRICING_CONF="$(readlink "$0" | xargs dirname)/pricing.conf"
+    fi
+fi
+
 if [[ ! -f "$PRICING_CONF" ]]; then
     echo "Pricing config not found: $PRICING_CONF" >&2
     exit 1
