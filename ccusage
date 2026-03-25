@@ -41,7 +41,7 @@ fi
 
 if ! [[ -f "$PRICING_CONF" ]]; then
     if test -h "$0"; then
-        PRICING_CONF="$(readlink "$0" | xargs dirname)/pricing.conf"
+        PRICING_CONF="$(readlink -f "$0" | xargs dirname)/pricing.conf"
     fi
 fi
 
