@@ -1,0 +1,136 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ccusage [OPTIONS]
+
+Print Claude API token usage and cost by day or month.
+
+Options:
+  --from YYYY-MM-DD   Start date (inclusive)
+  --to YYYY-MM-DD     End date (inclusive)
+  --month             Group by month instead of day
+  -h, --help          Show this help
+EOF
+    exit 0
+}
+
+DATE_FROM=""
+DATE_TO=""
+GROUP_BY="day"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --from) DATE_FROM="$2"; shift 2 ;;
+        --to)   DATE_TO="$2";   shift 2 ;;
+        --month) GROUP_BY="month"; shift ;;
+        -h|--help) usage ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+PROJECTS_DIR="$HOME/.claude/projects"
+PRICING_CONF="$(dirname "$0")/pricing.conf"
+
+if [[ ! -d "$PROJECTS_DIR" ]]; then
+    echo "No Claude projects directory found at $PROJECTS_DIR" >&2
+    exit 1
+fi
+
+if [[ ! -f "$PRICING_CONF" ]]; then
+    echo "Pricing config not found: $PRICING_CONF" >&2
+    exit 1
+fi
+
+# Extract usage records from all JSONL files as TSV:
+#   date  model  input  cache_write  cache_read  output
+# Then filter by date, compute cost per record, group by period, sort, and format.
+
+JQ_FILTER='
+    select(.type == "assistant") |
+    select(.message.usage != null) |
+    select(.message.model != null and .message.model != "<synthetic>") |
+    [
+        (.timestamp | split("T")[0]),
+        .message.model,
+        (.message.usage.input_tokens                    // 0 | tostring),
+        (.message.usage.cache_creation_input_tokens     // 0 | tostring),
+        (.message.usage.cache_read_input_tokens         // 0 | tostring),
+        (.message.usage.output_tokens                   // 0 | tostring)
+    ] | join("\t")
+'
+
+find "$PROJECTS_DIR" -name "*.jsonl" -print | while IFS= read -r f; do
+    jq -r "$JQ_FILTER" "$f" 2>/dev/null
+done | \
+awk -v from="$DATE_FROM" -v to="$DATE_TO" -v group="$GROUP_BY" -v pricing_conf="$PRICING_CONF" '
+BEGIN {
+    np = 0
+    while ((getline line < pricing_conf) > 0) {
+        if (line ~ /^#/ || line ~ /^[[:space:]]*$/) continue
+        n = split(line, f)
+        if (n >= 5) {
+            pat[np] = f[1]; pi[np] = f[2]+0; pcw[np] = f[3]+0
+            pcr[np] = f[4]+0; po[np] = f[5]+0
+            np++
+        }
+    }
+    close(pricing_conf)
+}
+function compute_cost(model, input, cw, cr, out,    i) {
+    for (i = 0; i < np; i++) {
+        if (pat[i] == "*" || index(model, pat[i]) > 0)
+            return (input*pi[i] + cw*pcw[i] + cr*pcr[i] + out*po[i]) / 1000000
+    }
+    return 0
+}
+{
+    date = $1; model = $2
+    input = $3 + 0; cw = $4 + 0; cr = $5 + 0; out = $6 + 0
+    if (from != "" && date < from) next
+    if (to   != "" && date > to)   next
+    period = (group == "month") ? substr(date, 1, 7) : date
+    print period "\t" input "\t" cw "\t" cr "\t" out "\t" compute_cost(model, input, cw, cr, out)
+}
+' | sort | \
+awk -v group="$GROUP_BY" '
+function rep(c, n,    s, i) { s = ""; for (i = 0; i < n; i++) s = s c; return s }
+BEGIN {
+    lw = (group == "month") ? 7 : 10
+    lbl = (group == "month") ? "Month" : "Date"
+    sep = rep("-", lw) "  ------------  ------------  ------------  ------------  ----------"
+    fmt_h = "%-" lw "s  %12s  %12s  %12s  %12s  %10s\n"
+    fmt_r = "%-" lw "s  %12d  %12d  %12d  %12d  %10.4f\n"
+    printf fmt_h, lbl, "Input", "CacheWrite", "CacheRead", "Output", "Cost($)"
+    print sep
+    cur = ""; rows = 0
+    total_in = total_cw = total_cr = total_out = total_cost = 0
+}
+{
+    period = $1
+    if (cur != period) {
+        if (cur != "") {
+            printf fmt_r, cur, r_in, r_cw, r_cr, r_out, r_cost
+            rows++
+        }
+        cur = period; r_in = r_cw = r_cr = r_out = r_cost = 0
+    }
+    r_in += $2; r_cw += $3; r_cr += $4; r_out += $5; r_cost += $6
+    total_in   += $2; total_cw += $3; total_cr += $4
+    total_out  += $5; total_cost += $6
+}
+END {
+    if (cur != "") {
+        printf fmt_r, cur, r_in, r_cw, r_cr, r_out, r_cost
+        rows++
+    }
+    if (rows == 0) {
+        print "No usage data found."
+    } else {
+        print sep
+        printf fmt_r, "TOTAL", total_in, total_cw, total_cr, total_out, total_cost
+    }
+}
+'
